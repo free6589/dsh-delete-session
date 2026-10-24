@@ -1,5 +1,13 @@
 # dsh-delete-session
 
+> **Fork note (`free6589/dsh-delete-session`).** Upstream hard-codes a *loopback only* fence on every
+> destructive route, so the plugin cannot be used at all when `dsh web` binds a LAN / Tailscale address
+> (`--host 100.111.111.88`): the peer address can never be `127.0.0.1` then, and the delete request is
+> refused with `403 {"error":"loopback only"}`. This fork replaces that hardcoded test with an explicit
+> peer/Host allow-list plus an optional shared token, while keeping the same-origin check. Defaults are
+> byte-for-byte upstream behaviour, so an unconfigured install is no weaker. See
+> [LAN / Tailscale access](#lan--tailscale-access).
+
 **DeepSeek Harness 会话删除插件 —— 在侧边栏会话菜单里直接删除会话。**
 
 给 DSH Web 侧边栏的会话 `...` 菜单（重命名 / 分叉 / 归档）补上「删除会话」，并可选地把这个对话产出的文件一起收走。
@@ -294,3 +302,55 @@ If this plugin helped, a ⭐ on [GitHub](https://github.com/DDDMUC/dsh-delete-se
 ### License
 
 MIT
+
+---
+
+## LAN / Tailscale access
+
+Upstream answers `403 {"ok":false,"code":"forbidden","error":"loopback only"}` for every request whose
+socket peer is not loopback. When the host is started as `dsh --profile web --host 100.111.111.88
+--port 3090`, **no** browser request can ever satisfy that, so deletion is impossible. This fork keeps
+four fences but makes the first two configurable:
+
+| fence | upstream | this fork |
+|---|---|---|
+| peer | must be loopback | must match `allowPeers` (CIDR or literal) |
+| `Host` header | must be `localhost`/`127.0.0.1`/`::1` | must match `allowHosts` (port ignored) |
+| `Origin` | must equal `Host` when present | unchanged |
+| token | — | when `token` is set, `x-dsh-delete-session-token` must match |
+
+### Configure
+
+`$DSH_HOME/delete-session.json` (re-read on mtime change, no restart needed for edits):
+
+```json
+{
+  "allowPeers": ["127.0.0.0/8", "::1", "100.64.0.0/10"],
+  "allowHosts": ["localhost", "127.0.0.1", "::1", "100.111.111.88"],
+  "token": ""
+}
+```
+
+`100.64.0.0/10` is the CGNAT range Tailscale hands out. Omit the file (or the keys) to keep upstream
+defaults. Env fallbacks: `DSH_DELETE_SESSION_ALLOW_PEERS`, `DSH_DELETE_SESSION_ALLOW_HOSTS`,
+`DSH_DELETE_SESSION_TOKEN`.
+
+### Token (optional hardening)
+
+Set `token` in the config **and** in the browser once per profile:
+
+```js
+localStorage.setItem('dsh-delete-session:token', '<the same string>')
+```
+
+Without it, anything that can reach the bound port on an allowed peer can `curl` a delete — a browser
+`Origin` check does not stop a non-browser client, which sends no `Origin` at all. With a tailnet you
+control, the allow-list alone is a defensible posture; with any doubt, set the token.
+
+### Known limits
+
+- The allow-list is per-machine configuration, not shipped policy: it trusts the network layer (tailnet
+  ACLs) as much as the code.
+- `100.64.0.0/10` is broad by design; narrow it to exact literals if only one device should delete.
+- `hostName()` also fixes an upstream edge case: upstream rejected the bracketed IPv6 authority
+  `[::1]:3090` because it split on the first `:`; this fork strips brackets before the port.

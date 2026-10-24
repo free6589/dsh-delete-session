@@ -1,7 +1,7 @@
 {
   "name": "dsh-delete-session",
-  "version": "0.2.3",
-  "description": "Delete sessions from the DSH Web sidebar: adds a Delete action to the session row menu with a risk-consent dialog, sends the session log, workspace accounting and live session state to the system trash (or removes them outright), and, when opted in, quarantines the files the conversation produced.",
+  "version": "0.2.4",
+  "description": "Delete sessions from the DSH Web sidebar: adds a Delete action to the session row menu with a risk-consent dialog, then removes the session log, workspace accounting and live session state. Fork: the destructive routes accept an explicit peer/Host allow-list (LAN / Tailscale) plus an optional shared token instead of loopback only.",
   "type": "module",
   "main": "src/index.js",
   "exports": {

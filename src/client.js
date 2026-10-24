@@ -508,6 +508,16 @@ window.__ModuleLoader__.load({
       writePref(ROOT_KEY, typeof value === 'string' && value.trim() !== '' ? value.trim() : null)
     }
 
+    /** Content-type plus the optional shared token this fork's host routes accept. */
+    function authHeaders() {
+      const headers = { 'content-type': 'application/json' }
+      try {
+        const token = localStorage.getItem('dsh-delete-session:token')
+        if (typeof token === 'string' && token !== '') headers['x-dsh-delete-session-token'] = token
+      } catch { /* storage unavailable */ }
+      return headers
+    }
+
     // --- host calls ------------------------------------------------------------
 
     /** The read-only artifact scan the dialog renders. */
@@ -517,7 +527,7 @@ window.__ModuleLoader__.load({
       payload.skipGit = skipGitRepos()
       return fetch('/dsh-delete-session/artifacts', {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: authHeaders(),
         body: JSON.stringify(payload),
       }).then(async (res) => {
         let data = {}
@@ -531,7 +541,7 @@ window.__ModuleLoader__.load({
     function postBrowse(target) {
       return fetch('/dsh-delete-session/browse', {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: authHeaders(),
         body: JSON.stringify(target === undefined || target === '' ? {} : { path: target }),
       }).then(async (res) => {
         let data = {}
@@ -549,7 +559,7 @@ window.__ModuleLoader__.load({
     function postPick() {
       return fetch('/dsh-delete-session/pick', {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: authHeaders(),
         body: JSON.stringify({}),
       }).then(async (res) => {
         let data = {}
@@ -567,7 +577,7 @@ window.__ModuleLoader__.load({
     function postReveal(target) {
       return fetch('/dsh-delete-session/reveal', {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: authHeaders(),
         body: JSON.stringify({ path: target }),
       }).then(async (res) => {
         let data = {}
@@ -599,7 +609,7 @@ window.__ModuleLoader__.load({
       payload.recycle = recycleSession()
       return fetch('/dsh-delete-session/delete', {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: authHeaders(),
         body: JSON.stringify(payload),
       }).then(async (res) => {
         let data = {}
@@ -1152,7 +1162,7 @@ window.__ModuleLoader__.load({
     function loadChildren(sessionId) {
       fetch(`/dsh-delete-session/children`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: authHeaders(),
         body: JSON.stringify({ sessionId }),
       })
         .then(async (res) => {

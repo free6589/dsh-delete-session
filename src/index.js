@@ -1846,15 +1846,128 @@ async function pickFolderNative() {
 
 // --- http --------------------------------------------------------------------
 
-function isLoopbackAddress(address) {
-  if (typeof address !== 'string' || address.length === 0) return false
-  return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1' || address.startsWith('127.')
+// --- access policy (fork) ----------------------------------------------------
+//
+// Upstream refuses every non-loopback request ("loopback only"), which makes the
+// plugin unusable whenever `dsh web` binds a LAN / Tailscale address
+// (`--host 100.111.111.88`): the peer address can never be 127.0.0.1 then.
+//
+// This fork keeps the same fences but turns the first two into an explicit
+// allow-list instead of a hardcoded loopback test:
+//
+//   peer   - must match allowPeers (CIDR or literal)
+//   Host   - must match allowHosts (port ignored)
+//   Origin - must equal Host whenever the browser sends one
+//   token  - when configured, x-dsh-delete-session-token must match
+//
+// Defaults reproduce upstream behaviour exactly (loopback peer, loopback Host,
+// no token), so an unconfigured install is no weaker than upstream.
+//
+// Resolution order:
+//   1. $DSH_HOME/delete-session.json  { "allowPeers": [...], "allowHosts": [...], "token": "..." }
+//   2. env DSH_DELETE_SESSION_ALLOW_PEERS / _ALLOW_HOSTS / _TOKEN
+//   3. upstream defaults
+// The file is re-read when its mtime changes, so edits apply without a restart.
+
+const DEFAULT_ALLOW_PEERS = ['127.0.0.0/8', '::1', '::ffff:127.0.0.1']
+const DEFAULT_ALLOW_HOSTS = ['localhost', '127.0.0.1', '::1']
+
+function ipv4ToInt(ip) {
+  const parts = ip.split('.')
+  if (parts.length !== 4) return null
+  let value = 0
+  for (const part of parts) {
+    if (!/^\d{1,3}$/.test(part)) return null
+    const octet = Number(part)
+    if (octet > 255) return null
+    value = value * 256 + octet
+  }
+  return value >>> 0
 }
 
-function isLocalHostHeader(host) {
-  if (typeof host !== 'string' || host.length === 0) return false
-  const name = host.split(':')[0].replace(/^\[|\]$/g, '').toLowerCase()
-  return name === 'localhost' || name === '127.0.0.1' || name === '::1'
+function normalizePeer(address) {
+  if (typeof address !== 'string') return ''
+  return address.startsWith('::ffff:') ? address.slice(7) : address
+}
+
+function peerAllowed(address, allowPeers) {
+  const peer = normalizePeer(address)
+  if (peer === '') return false
+  for (const rule of allowPeers) {
+    if (typeof rule !== 'string' || rule === '') continue
+    const slash = rule.indexOf('/')
+    if (slash === -1) {
+      if (normalizePeer(rule) === peer) return true
+      continue
+    }
+    const base = ipv4ToInt(rule.slice(0, slash))
+    const peerInt = ipv4ToInt(peer)
+    if (base === null || peerInt === null) continue
+    const bits = Number(rule.slice(slash + 1))
+    if (!Number.isInteger(bits) || bits < 0 || bits > 32) continue
+    const mask = bits === 0 ? 0 : (0xffffffff << (32 - bits)) >>> 0
+    if (((base & mask) >>> 0) === ((peerInt & mask) >>> 0)) return true
+  }
+  return false
+}
+
+function hostName(host) {
+  if (typeof host !== 'string' || host === '') return ''
+  const raw = host.trim().toLowerCase()
+  // IPv6 authority keeps its colons inside brackets: [::1]:3090 -> ::1
+  if (raw.startsWith('[')) {
+    const end = raw.indexOf(']')
+    if (end !== -1) return raw.slice(1, end)
+  }
+  const colon = raw.indexOf(':')
+  if (colon === -1) return raw
+  // A bare IPv6 literal has more than one colon and no port to strip.
+  if (raw.indexOf(':', colon + 1) !== -1) return raw
+  return raw.slice(0, colon)
+}
+
+function hostAllowed(host, allowHosts) {
+  const name = hostName(host)
+  if (name === '') return false
+  return allowHosts.some((rule) => typeof rule === 'string' && hostName(rule) === name)
+}
+
+function splitList(value) {
+  if (typeof value !== 'string') return []
+  return value.split(',').map((item) => item.trim()).filter(Boolean)
+}
+
+let policyCache = { key: '', policy: null, mtime: -1 }
+
+function accessPolicy() {
+  const file = process.env.DSH_HOME ? path.join(process.env.DSH_HOME, 'delete-session.json') : ''
+  let raw = null
+  let mtime = -1
+  if (file) {
+    try {
+      mtime = fs.statSync(file).mtimeMs
+      if (policyCache.policy && policyCache.key === file && policyCache.mtime === mtime) {
+        return policyCache.policy
+      }
+      raw = JSON.parse(fs.readFileSync(file, 'utf8'))
+    } catch {
+      raw = null
+    }
+  }
+  const filePeers = raw && Array.isArray(raw.allowPeers) ? raw.allowPeers : []
+  const fileHosts = raw && Array.isArray(raw.allowHosts) ? raw.allowHosts : []
+  const allowPeers = filePeers.length > 0 ? filePeers : splitList(process.env.DSH_DELETE_SESSION_ALLOW_PEERS)
+  const allowHosts = fileHosts.length > 0 ? fileHosts : splitList(process.env.DSH_DELETE_SESSION_ALLOW_HOSTS)
+  const token = raw && typeof raw.token === 'string' && raw.token !== ''
+    ? raw.token
+    : (process.env.DSH_DELETE_SESSION_TOKEN || '')
+  const policy = {
+    allowPeers: allowPeers.length > 0 ? allowPeers : DEFAULT_ALLOW_PEERS,
+    allowHosts: allowHosts.length > 0 ? allowHosts : DEFAULT_ALLOW_HOSTS,
+    token,
+  }
+  if (file) policyCache = { key: file, policy, mtime }
+  return policy
 }
 
 function sendJson(res, status, body) {
@@ -1879,17 +1992,23 @@ function readBody(req) {
   })
 }
 
-// Destructive local endpoint: loopback socket, loopback Host header, and a
-// same-origin check when the browser sends Origin. Tunneled or LAN clients
-// get 403 before any session data is touched.
+// Destructive endpoints: allow-listed peer, allow-listed Host header, a
+// same-origin check when the browser sends Origin, and an optional shared
+// token. Every route under ROUTE_PREFIX runs this before touching session data.
 function guard(req, res) {
-  if (!isLoopbackAddress(req.socket && req.socket.remoteAddress)) {
-    sendJson(res, 403, { ok: false, code: 'forbidden', error: 'loopback only' })
+  const policy = accessPolicy()
+  if (!peerAllowed(req.socket && req.socket.remoteAddress, policy.allowPeers)) {
+    sendJson(res, 403, {
+      ok: false,
+      code: 'forbidden',
+      error: 'peer not allowed',
+      peer: normalizePeer(req.socket && req.socket.remoteAddress),
+    })
     return false
   }
   const host = req.headers.host
-  if (!isLocalHostHeader(host)) {
-    sendJson(res, 403, { ok: false, code: 'forbidden', error: 'unexpected host' })
+  if (!hostAllowed(host, policy.allowHosts)) {
+    sendJson(res, 403, { ok: false, code: 'forbidden', error: 'unexpected host', host: String(host || '') })
     return false
   }
   const origin = req.headers.origin
@@ -1904,6 +2023,10 @@ function guard(req, res) {
       sendJson(res, 403, { ok: false, code: 'forbidden', error: 'cross-origin request' })
       return false
     }
+  }
+  if (policy.token && req.headers['x-dsh-delete-session-token'] !== policy.token) {
+    sendJson(res, 403, { ok: false, code: 'forbidden', error: 'token required' })
+    return false
   }
   return true
 }
@@ -2234,3 +2357,7 @@ export const internals = {
   trashCommandFor,
   warmCompiledHelpers,
 }
+
+// Fork addition: exported for the access-policy tests (the plugin surface is
+// still just `apply`).
+export { accessPolicy, hostAllowed, peerAllowed }
